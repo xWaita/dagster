@@ -2381,6 +2381,38 @@ def test_reverse_pagination_negative_end_offset():
     ) == list(reversed(all_keys))
 
 
+@pytest.mark.parametrize("end_offset", [-2, 0, 2])
+def test_pagination_past_end_date(end_offset: int):
+    # end_date and end_offset bound the partition set independently, so a past end_date wins over
+    # the current-time bound regardless of the offset.
+    partitions_def = dg.DailyPartitionsDefinition(
+        start_date="2021-05-05", end_date="2021-06-01", end_offset=end_offset
+    )
+    current_time = datetime.strptime("2021-07-05", DATE_FORMAT)
+    partition_context = PartitionLoadingContext(
+        temporal_context=TemporalContext(effective_dt=current_time, last_event_id=None),
+        dynamic_partitions_store=None,
+    )
+    all_keys = partitions_def.get_partition_keys(current_time)
+    assert all_keys[-1] == "2021-05-31"
+
+    paginated_results = partitions_def.get_paginated_partition_keys(
+        context=partition_context, limit=3, ascending=False, cursor=None
+    )
+    assert paginated_results.results == ["2021-05-31", "2021-05-30", "2021-05-29"]
+
+    assert (
+        get_paginated_partition_keys(partitions_def, current_time=current_time, ascending=True)
+        == all_keys
+    )
+    assert get_paginated_partition_keys(
+        partitions_def, current_time=current_time, ascending=False
+    ) == list(reversed(all_keys))
+
+    with partition_loading_context(current_time):
+        assert partitions_def.get_partition_keys_between_indexes(0, 1000) == all_keys
+
+
 def test_exclusions():
     company_holidays = [
         create_datetime(2025, 1, 1),

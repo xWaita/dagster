@@ -308,36 +308,24 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
         # Start index is inclusive, end index is exclusive.
         # Method added for performance reasons, to only string format
         # partition keys included within the indices.
-        current_timestamp = self._get_current_timestamp()
+        last_partition_window = self._get_last_partition_window(self._get_current_timestamp())
+        if not last_partition_window:
+            return []
 
-        partitions_past_current_time = 0
+        last_start_timestamp = last_partition_window.start.timestamp()
         partition_keys = []
-        reached_end = False
 
         for idx, time_window in enumerate(self._iterate_time_windows(self.start_timestamp)):
-            if time_window.end.timestamp() >= current_timestamp:
-                reached_end = True
-            if self.end_timestamp is not None and time_window.end.timestamp() > self.end_timestamp:
-                reached_end = True
-            if (
-                time_window.end.timestamp() <= current_timestamp
-                or partitions_past_current_time < self.end_offset
-            ):
-                if idx >= start_idx and idx < end_idx:
-                    partition_keys.append(
-                        dst_safe_strftime(
-                            time_window.start, self.timezone, self.fmt, self.cron_schedule
-                        )
-                    )
-                if time_window.end.timestamp() > current_timestamp:
-                    partitions_past_current_time += 1
-            else:
+            if time_window.start.timestamp() > last_start_timestamp:
                 break
+            if start_idx <= idx < end_idx:
+                partition_keys.append(
+                    dst_safe_strftime(
+                        time_window.start, self.timezone, self.fmt, self.cron_schedule
+                    )
+                )
             if len(partition_keys) >= end_idx - start_idx:
                 break
-
-        if reached_end and self.end_offset < 0:
-            partition_keys = partition_keys[: self.end_offset]
 
         return partition_keys
 
@@ -395,54 +383,37 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
         cursor: str | None = None,
     ) -> PaginatedResults[str]:
         with partition_loading_context(new_ctx=context):
-            current_timestamp = self._get_current_timestamp()
+            # Bound both directions by the definition's last partition window rather than by the
+            # current time: it is what resolves end_date, end_offset and exclusions, so deriving
+            # the bound anywhere else lets pagination drift from get_partition_keys().
+            last_partition_window = self._get_last_partition_window(self._get_current_timestamp())
+            if not last_partition_window:
+                return PaginatedResults(
+                    results=[],
+                    cursor=str(
+                        TimeWindowCursor(
+                            start_timestamp=int(self.start_timestamp),
+                            end_timestamp=int(self.start_timestamp),
+                            offset_partition_count=0,
+                        )
+                    ),
+                    has_more=False,
+                )
 
             if cursor:
                 time_window_cursor = TimeWindowCursor.from_cursor(cursor)
                 start_timestamp = time_window_cursor.start_timestamp
                 end_timestamp = time_window_cursor.end_timestamp
-                offset_partitions_count = time_window_cursor.offset_partition_count
             else:
                 start_timestamp = self.start_timestamp
-                end_timestamp = current_timestamp
-                offset_partitions_count = 0
+                end_timestamp = last_partition_window.end.timestamp()
 
             partition_keys: list[str] = []
             has_more = False
 
             if not ascending:
-                offset_time_windows = []
-                if self.end_offset > 0 and self.end_offset > offset_partitions_count:
-                    last_no_offset_time_window = next(
-                        iter(self._reverse_iterate_time_windows(end_timestamp)), None
-                    )
-                    lookforward_time = (
-                        last_no_offset_time_window.end.timestamp()
-                        if last_no_offset_time_window
-                        else end_timestamp
-                    )
-                    for time_window in self._iterate_time_windows(lookforward_time):
-                        if (
-                            self.end_timestamp is not None
-                            and time_window.end.timestamp() > self.end_timestamp
-                        ):
-                            break
-
-                        if len(offset_time_windows) >= self.end_offset - offset_partitions_count:
-                            break
-
-                        if not self.is_window_start_excluded(time_window.start):
-                            offset_time_windows.append(
-                                dst_safe_strftime(
-                                    time_window.start, self.timezone, self.fmt, self.cron_schedule
-                                )
-                            )
-
-                partition_keys = list(reversed(offset_time_windows))[:limit]
-                offset_partitions_count += len(partition_keys)
-
                 for time_window in self._reverse_iterate_time_windows(end_timestamp):
-                    if len(partition_keys) >= limit - min(0, self.end_offset):
+                    if len(partition_keys) >= limit:
                         has_more = True
                         break
 
@@ -454,66 +425,37 @@ class TimeWindowPartitionsDefinition(PartitionsDefinition, IHaveNew):
                             time_window.start, self.timezone, self.fmt, self.cron_schedule
                         )
                     )
-
-                if self.end_offset < 0 and not cursor:
-                    # only subset if we did not have a cursor... if we did have a cursor, we've already
-                    # applied the offset to the end, since we're moving backwards from the end
-                    partition_keys = partition_keys[-1 * min(0, self.end_offset) :]
-
             else:
                 for time_window in self._iterate_time_windows(start_timestamp):
-                    if (
-                        self.end_timestamp is not None
-                        and time_window.end.timestamp() > self.end_timestamp
-                    ):
-                        break
-                    if (
-                        time_window.end.timestamp() <= end_timestamp
-                        or offset_partitions_count < self.end_offset
-                    ):
-                        partition_keys.append(
-                            dst_safe_strftime(
-                                time_window.start, self.timezone, self.fmt, self.cron_schedule
-                            )
-                        )
-                        if time_window.end.timestamp() > end_timestamp:
-                            offset_partitions_count += 1
-                        if len(partition_keys) >= limit - min(0, self.end_offset):
-                            has_more = True
-                            break
-                    else:
+                    if time_window.start.timestamp() > last_partition_window.start.timestamp():
                         break
 
-                if has_more:
-                    # exited due to limit; subset in case we overshot (if end_offset < 0)
-                    partition_keys = partition_keys[:limit]
-                elif self.end_offset < 0:
-                    # only subset if we did not eject early due to the limit
-                    partition_keys = partition_keys[: self.end_offset]
+                    if len(partition_keys) >= limit:
+                        has_more = True
+                        break
+
+                    partition_keys.append(
+                        dst_safe_strftime(
+                            time_window.start, self.timezone, self.fmt, self.cron_schedule
+                        )
+                    )
 
             if not partition_keys:
                 next_cursor = TimeWindowCursor(
                     start_timestamp=int(start_timestamp),
                     end_timestamp=int(end_timestamp),
-                    offset_partition_count=offset_partitions_count,
-                )
-            elif ascending:
-                last_partition_key = partition_keys[-1]
-                last_time_window = self.time_window_for_partition_key(last_partition_key)
-                next_cursor = TimeWindowCursor(
-                    start_timestamp=int(last_time_window.end.timestamp()),
-                    end_timestamp=int(end_timestamp),
-                    offset_partition_count=offset_partitions_count,
+                    offset_partition_count=0,
                 )
             else:
-                last_partition_key = partition_keys[-1]
-                last_time_window = self.time_window_for_partition_key(last_partition_key)
+                last_time_window = self.time_window_for_partition_key(partition_keys[-1])
                 next_cursor = TimeWindowCursor(
-                    start_timestamp=int(start_timestamp),
+                    start_timestamp=int(last_time_window.end.timestamp())
+                    if ascending
+                    else int(start_timestamp),
                     end_timestamp=int(end_timestamp)
-                    if self.end_offset > 0 and offset_partitions_count < self.end_offset
+                    if ascending
                     else int(last_time_window.start.timestamp()),
-                    offset_partition_count=offset_partitions_count,
+                    offset_partition_count=0,
                 )
 
             return PaginatedResults(
